@@ -1,87 +1,88 @@
-#Copyright (c) Microsoft Corporation. All rights reserved. 
-#Licensed under the MIT License.
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
 
-
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Dense, Dropout, Flatten, LeakyReLU
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import initializers
 import numpy as np
-
-def LFW_Generator(randomDim = 100, optim = Adam(lr=0.0002, beta_1=0.5)):
-    """Creates a generateof for LFW dataset
-
-    Args:
-        randomDim (int, optional): input shape. Defaults to 100.
-        optim ([Adam], optional): optimizer. Defaults to Adam(lr=0.0002, beta_1=0.5).
-    """
-    generator = Sequential()
-    generator.add(Dense(512, input_dim=randomDim, kernel_initializer=initializers.RandomNormal(stddev=0.02),
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(LeakyReLU(0.2,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(Dense(512,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(LeakyReLU(0.2,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(Dense(1024,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(LeakyReLU(0.2,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(Dense(2914, activation='tanh',
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.compile(loss='binary_crossentropy', optimizer=optim)
-    
-    return generator
+import torch
+import torch.nn as nn
 
 
-def LFW_Discriminator(optim = Adam(lr=0.0002, beta_1=0.5)):
-    """Discriminator for LFW dataset
+def _init_weights(module: nn.Module) -> None:
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
-    Args:
-        optim ([Adam], optional): optimizer. Defaults to Adam(lr=0.0002, beta_1=0.5).
-    """
-    discriminator = Sequential()
-    discriminator.add(Dense(2048, input_dim=2914, kernel_initializer=initializers.RandomNormal(stddev=0.02),
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(512,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(256,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(1, activation='sigmoid',
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.compile(loss='binary_crossentropy', optimizer=optim)
-    
-    return discriminator
 
-def LFW_DiscriminatorPrivate(OutSize = 2, optim = Adam(lr=0.0002, beta_1=0.5)):
-    """The discriminator designed to guess which Generator generated the data
+def make_optimizer(model: nn.Module, lr: float = 0.0002, beta1: float = 0.5) -> torch.optim.Optimizer:
+    return torch.optim.Adam(model.parameters(), lr=lr, betas=(beta1, 0.999))
 
-    Args:
-        OutSize (int, optional): [description]. Defaults to 2.
-        optim ([type], optional): optimizer. Defaults to Adam(lr=0.0002, beta_1=0.5).
-    """
-    discriminator = Sequential()
-    discriminator.add(Dense(2048, input_dim=2914, kernel_initializer=initializers.RandomNormal(stddev=0.02),
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(512,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(256,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(OutSize, activation='softmax',
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.compile(loss='sparse_categorical_crossentropy', optimizer=optim)
-    
-    return discriminator
+
+class LFW_Generator(nn.Module):
+    """Generator for LFW (fully-connected)."""
+
+    def __init__(self, randomDim: int = 100):
+        super().__init__()
+        self.randomDim = randomDim
+        self.net = nn.Sequential(
+            nn.Linear(randomDim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 1024),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(1024, 2914),
+            nn.Tanh(),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class LFW_Discriminator(nn.Module):
+    """Discriminator for LFW (binary classification)."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2914, 2048),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(2048, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+            nn.Sigmoid(),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x.view(x.size(0), -1))
+
+
+class LFW_DiscriminatorPrivate(nn.Module):
+    """Classifier that predicts generator index."""
+
+    def __init__(self, OutSize: int = 2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2914, 2048),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(2048, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, OutSize),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x.view(x.size(0), -1))
+
+
+__all__ = [
+    "LFW_Generator",
+    "LFW_Discriminator",
+    "LFW_DiscriminatorPrivate",
+    "make_optimizer",
+]

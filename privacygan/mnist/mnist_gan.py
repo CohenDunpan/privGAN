@@ -1,94 +1,91 @@
-#Copyright (c) Microsoft Corporation. All rights reserved. 
-#Licensed under the MIT License.
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
 
-
-import tensorflow as tf
-from tensorflow.keras import Input
-from tensorflow.keras import Model, Sequential
-from tensorflow.keras.layers import Dense, Dropout, Flatten, LeakyReLU
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import initializers
 import numpy as np
+import torch
+import torch.nn as nn
 
 
-def MNIST_Generator(randomDim = 100, optim = Adam(lr=0.0002, beta_1=0.5)):
-    """Creates a generator for MNIST dataset
-
-    Args:
-        randomDim (int, optional): input shape. Defaults to 100.
-        optim ([Adam], optional): optimizer. Defaults to Adam(lr=0.0002, beta_1=0.5).
-
-    """
-    
-    generator = Sequential()
-    generator.add(Dense(512, input_dim=randomDim, kernel_initializer=initializers.RandomNormal(stddev=0.02),
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(LeakyReLU(0.2,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(Dense(512,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(LeakyReLU(0.2,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(Dense(1024,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(LeakyReLU(0.2,
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.add(Dense(784, activation='tanh',
-                 name = 'layer'+str(np.random.randint(0,1e9))))
-    generator.compile(loss='binary_crossentropy', optimizer=optim)
-    
-    return generator
+def _init_weights(module: nn.Module) -> None:
+    # Match Keras RandomNormal(stddev=0.02)
+    if isinstance(module, (nn.Linear, nn.ConvTranspose2d, nn.Conv2d)):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
-def MNIST_Discriminator(optim = Adam(lr=0.0002, beta_1=0.5)):
-    """Discriminator for MNIST dataset
+def make_optimizer(model: nn.Module, lr: float = 0.0002, beta1: float = 0.5) -> torch.optim.Optimizer:
+    """Adam optimizer used throughout the GANs."""
 
-    Args:
-        optim ([Adam], optional): optimizer. Defaults to Adam(lr=0.0002, beta_1=0.5).
-    """
-    
-    discriminator = Sequential()
-    discriminator.add(Dense(2048, input_dim=784, kernel_initializer=initializers.RandomNormal(stddev=0.02),
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(512,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(256,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(1, activation='sigmoid',
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.compile(loss='binary_crossentropy', optimizer=optim)
-    
-    return discriminator
+    return torch.optim.Adam(model.parameters(), lr=lr, betas=(beta1, 0.999))
 
-def MNIST_DiscriminatorPrivate(OutSize = 2, optim = Adam(lr=0.0002, beta_1=0.5)):
-    """The discriminator designed to guess which Generator generated the data
 
-    Args:
-        OutSize (int, optional): [description]. Defaults to 2.
-        optim ([type], optional): optimizer. Defaults to Adam(lr=0.0002, beta_1=0.5).
-    """
-    
-    discriminator = Sequential()
-    discriminator.add(Dense(2048, input_dim=784, kernel_initializer=initializers.RandomNormal(stddev=0.02),
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(512,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(256,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(LeakyReLU(0.2,
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.add(Dense(OutSize, activation='softmax',
-                     name = 'layer'+str(np.random.randint(0,1e9))))
-    discriminator.compile(loss='sparse_categorical_crossentropy', optimizer=optim)
-    
-    return discriminator
+class MNIST_Generator(nn.Module):
+    """Generator for MNIST (fully-connected, 784 output with tanh)."""
+
+    def __init__(self, randomDim: int = 100):
+        super().__init__()
+        self.randomDim = randomDim
+        self.net = nn.Sequential(
+            nn.Linear(randomDim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 1024),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(1024, 784),
+            nn.Tanh(),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class MNIST_Discriminator(nn.Module):
+    """Discriminator for MNIST (binary classification with sigmoid)."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(784, 2048),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(2048, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 1),
+            nn.Sigmoid(),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x.view(x.size(0), -1))
+
+
+class MNIST_DiscriminatorPrivate(nn.Module):
+    """Classifier to guess which generator produced the sample."""
+
+    def __init__(self, OutSize: int = 2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(784, 2048),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(2048, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, OutSize),
+        )
+        self.apply(_init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x.view(x.size(0), -1))
+
+
+__all__ = [
+    "MNIST_Generator",
+    "MNIST_Discriminator",
+    "MNIST_DiscriminatorPrivate",
+    "make_optimizer",
+]

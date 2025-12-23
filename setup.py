@@ -30,25 +30,17 @@ setup(
     license='MIT',
     author ='Sumit Mukherjee, Nabajyoti Patowary',
     author_email='privgan@microsoft.com',
-    description='Privacy protected GAN for image data',
-    long_description='This repository contains the source code for PrivGan - a novel approach \
-    for deterring membership inference attacks on GAN generated synthetic medical data.Currently, \
-    the repository contains the jupyter notebooks for various datasets. We will be converting \
-    the code into a library in the future. Please visit our paper \
-    "PrivGAN: Protecting GANs from membership inference attacks at low cost" [ArXiv Link](https://arxiv.org/abs/2001.00071) submitted at PETS 2021.',
+    description='Privacy protected GAN for image data (PyTorch)',
+    long_description='PrivGAN implemented with PyTorch for privacy-preserving GAN training and evaluation.',
     long_description_content_type="text/markdown",
     install_requires=[
         'numpy>=1.16.2',
-        'pandas>=0.25.3', 
+        'pandas>=0.25.3',
         'tqdm>=4.38.0',
-        'keras>=2.2.4',
         'scipy>=1.1.0',
-        'matplotlib>=3.3.0'
-        
+        'matplotlib>=3.3.0',
+        'scikit-learn>=0.20.3',
+        'torch>=2.0.0',
+        'torchvision>=0.15.0',
     ],
-    # Explicit dependence on TensorFlow is not supported.
-    # See https://github.com/tensorflow/tensorflow/issues/7166
-    extras_require={
-        'tf': ['tensorflow>=1.14.0']
-    },
     packages=find_packages())

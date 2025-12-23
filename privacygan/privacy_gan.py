@@ -1,534 +1,562 @@
-#Copyright (c) Microsoft Corporation. All rights reserved. 
-#Licensed under the MIT License.
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
 
-import os
-import numpy as np
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-
-import tensorflow as tf
-from tensorflow.keras import Input
-from tensorflow.keras import Model, Sequential
-from tensorflow.keras.layers import Reshape, Dense, Dropout, Flatten, LeakyReLU, Conv2D, MaxPool2D, ZeroPadding2D, Conv2DTranspose, UpSampling2D, BatchNormalization
-from tensorflow.keras.optimizers import Adam
-
-from tensorflow.keras.datasets import mnist,cifar10
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import initializers
-from scipy import stats
 import warnings
-import pandas as pd 
-from privacygan.mnist.mnist_gan import MNIST_Discriminator, MNIST_Generator, MNIST_DiscriminatorPrivate
+from typing import List, Optional, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from scipy import stats
+from sklearn.decomposition import PCA
+from torch.utils.data import DataLoader, TensorDataset
+
+from privacygan.mnist.mnist_gan import (
+    MNIST_Discriminator,
+    MNIST_DiscriminatorPrivate,
+    MNIST_Generator,
+    make_optimizer,
+)
+
 warnings.filterwarnings("ignore")
 
 
-##########################################  GANs ######################################################################
+def _get_device(device: Optional[torch.device] = None) -> torch.device:
+    if device is not None:
+        return device
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def SimpGAN(X_train, generator = MNIST_Generator(), discriminator = MNIST_Discriminator(),
-            randomDim=100, epochs=200, batchSize=128, optim = Adam(lr=0.0002, beta_1=0.5),
-           verbose = 1, lSmooth = 0.9, SplitTF = False):
 
-    # Combined network
-    discriminator.trainable = False
-    ganInput = Input(shape=(randomDim,))
-    x = generator(ganInput)
-    ganOutput = discriminator(x)
-    gan = Model(inputs=ganInput, outputs=ganOutput)
-    gan.compile(loss='binary_crossentropy', optimizer=optim)
+def _to_tensor(data: np.ndarray, device: torch.device) -> torch.Tensor:
+    return torch.tensor(data, dtype=torch.float32, device=device)
 
-    dLosses = []
-    gLosses = []
-    
-    batchCount = X_train.shape[0] / batchSize
+
+def _set_requires_grad(module: nn.Module, flag: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad = flag
+
+
+##########################################  GANs #############################################
+
+
+def SimpGAN(
+    X_train: np.ndarray,
+    generator: nn.Module = None,
+    discriminator: nn.Module = None,
+    randomDim: int = 100,
+    epochs: int = 200,
+    batchSize: int = 128,
+    lr: float = 0.0002,
+    beta1: float = 0.5,
+    verbose: int = 1,
+    lSmooth: float = 0.9,
+    SplitTF: bool = False,
+    device: Optional[torch.device] = None,
+):
+    """Single GAN training loop implemented in PyTorch."""
+
+    device = _get_device(device)
+    generator = generator or MNIST_Generator(randomDim=randomDim)
+    discriminator = discriminator or MNIST_Discriminator()
+    generator.to(device)
+    discriminator.to(device)
+
+    g_opt = make_optimizer(generator, lr=lr, beta1=beta1)
+    d_opt = make_optimizer(discriminator, lr=lr, beta1=beta1)
+    bce = nn.BCELoss()
+
+    dataset = TensorDataset(_to_tensor(X_train, device))
+    loader = DataLoader(dataset, batch_size=batchSize, shuffle=True, drop_last=True)
+
+    dLosses: List[float] = []
+    gLosses: List[float] = []
+
     print('Epochs:', epochs)
     print('Batch size:', batchSize)
-    print('Batches per epoch:', batchCount)
+    print('Batches per epoch:', len(loader))
 
-    for e in range(1, epochs+1):
-        g_t = []
-        d_t = []
-        for i in range(int(batchCount)):
-            # Get a random set of input noise and images
-            noise = np.random.normal(0, 1, size=[batchSize, randomDim])
-            imageBatch = X_train[np.random.randint(0, X_train.shape[0], size=batchSize)]
+    for e in range(1, epochs + 1):
+        g_t: List[float] = []
+        d_t: List[float] = []
 
-            # Generate fake MNIST images
-            generatedImages = generator.predict(noise)
-            # print np.shape(imageBatch), np.shape(generatedImages)
-            X = np.concatenate([imageBatch, generatedImages])
+        for i, (real_batch,) in enumerate(loader):
+            noise = torch.randn(batchSize, randomDim, device=device)
+            fake_batch = generator(noise)
 
-            # Labels for generated and real data
-            yDis = np.zeros(2*batchSize)
-            # One-sided label smoothing
-            yDis[:batchSize] = lSmooth
+            # discriminator step
+            _set_requires_grad(discriminator, True)
+            d_opt.zero_grad()
+            real_labels = torch.full((batchSize, 1), lSmooth, device=device)
+            fake_labels = torch.zeros(batchSize, 1, device=device)
 
-            # Train discriminator
-            discriminator.trainable = True
-            #dloss = discriminator.train_on_batch(X, yDis)
-            if SplitTF:
-                d_r = discriminator.train_on_batch(imageBatch, lSmooth*np.ones(batchSize))
-                d_f = discriminator.train_on_batch(generatedImages,np.zeros(batchSize))    
-                dloss = d_r + d_f
-            else:
-                dloss = discriminator.train_on_batch(X, yDis)
+            d_loss_real = bce(discriminator(real_batch), real_labels)
+            d_loss_fake = bce(discriminator(fake_batch.detach()), fake_labels)
+            d_loss = d_loss_real + d_loss_fake
+            d_loss.backward()
+            d_opt.step()
+            _set_requires_grad(discriminator, False)
 
-            discriminator.trainable = False
+            # generator step
+            g_opt.zero_grad()
+            gen_labels = torch.ones(batchSize, 1, device=device)
+            g_loss = bce(discriminator(fake_batch), gen_labels)
+            g_loss.backward()
+            g_opt.step()
 
-
-            # Train generator
-            noise = np.random.normal(0, 1, size=[batchSize, randomDim])
-            yGen = np.ones(batchSize)
-            gloss = gan.train_on_batch(noise, yGen)
-            
-            if verbose ==1:
-                
+            if verbose == 1:
                 print(
-                    'epoch = %d/%d, batch = %d/%d, d_loss=%.3f, g_loss=%.3f' % 
-                    (e, epochs, i, batchCount, dloss, gloss),
-                    100*' ',
-                    end='\r'
+                    f"epoch = {e}/{epochs}, batch = {i+1}/{len(loader)}, d_loss={d_loss.item():.3f}, g_loss={g_loss.item():.3f}",
+                    end='\r',
                 )
-            
-            d_t += [dloss]
-            g_t += [gloss]
 
-        # Store loss of most recent batch from this epoch
-        dLosses.append(np.mean(d_t))
-        gLosses.append(np.mean(g_t))
-        
-        if e%verbose == 0:
-            print('epoch = %d/%d, d_loss=%.3f, g_loss=%.3f' % (e, epochs,  np.mean(d_t),np.mean(g_t)), 100*' ')
-                
-    return (generator, discriminator, dLosses, gLosses)
+            d_t.append(d_loss.item())
+            g_t.append(g_loss.item())
 
+        dLosses.append(float(np.mean(d_t)))
+        gLosses.append(float(np.mean(g_t)))
 
+        if verbose == 1:
+            print(
+                f"epoch = {e}/{epochs}, d_loss={dLosses[-1]:.3f}, g_loss={gLosses[-1]:.3f}"
+            )
 
-def TrainDiscriminator(X_train, y_train, discriminator = MNIST_DiscriminatorPrivate(OutSize = 2),
-            randomDim=100, epochs=200, batchSize=128, optim = Adam(lr=0.0002, beta_1=0.5),
-           verbose = 1):
+    return generator, discriminator, dLosses, gLosses
 
 
-    discriminator.fit(X_train, y_train,
-          batch_size=batchSize,
-          epochs=epochs,
-          verbose=verbose,
-          validation_data=(X_train, y_train))
-    
-        
-    return (discriminator) 
-    
-    
+def TrainDiscriminator(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    discriminator: nn.Module = None,
+    epochs: int = 200,
+    batchSize: int = 128,
+    lr: float = 0.0002,
+    beta1: float = 0.5,
+    device: Optional[torch.device] = None,
+):
+    """Train the privacy discriminator (multi-class classifier)."""
 
-def privGAN(X_train, generators = [MNIST_Generator(),MNIST_Generator()], 
-            discriminators = [MNIST_Discriminator(),MNIST_Discriminator()],
-            pDisc = MNIST_DiscriminatorPrivate(OutSize = 2), 
-            randomDim=100, disc_epochs = 50, epochs=200, dp_delay = 100, 
-            batchSize=128, optim = Adam(lr=0.0002, beta_1=0.5), verbose = 1, 
-            lSmooth = 0.95, privacy_ratio = 1.0, SplitTF = False):
-    
-    
-    #make sure the number of generators is the same as the number of discriminators 
+    device = _get_device(device)
+    discriminator = discriminator or MNIST_DiscriminatorPrivate(OutSize=len(np.unique(y_train)))
+    discriminator.to(device)
+
+    opt = make_optimizer(discriminator, lr=lr, beta1=beta1)
+    ce = nn.CrossEntropyLoss()
+
+    dataset = TensorDataset(_to_tensor(X_train, device), torch.tensor(y_train, dtype=torch.long, device=device))
+    loader = DataLoader(dataset, batch_size=batchSize, shuffle=True, drop_last=True)
+
+    for _ in range(epochs):
+        for xb, yb in loader:
+            opt.zero_grad()
+            logits = discriminator(xb)
+            loss = ce(logits, yb)
+            loss.backward()
+            opt.step()
+
+    return discriminator
+
+
+def privGAN(
+    X_train: np.ndarray,
+    generators: Optional[Sequence[nn.Module]] = None,
+    discriminators: Optional[Sequence[nn.Module]] = None,
+    pDisc: Optional[nn.Module] = None,
+    randomDim: int = 100,
+    disc_epochs: int = 50,
+    epochs: int = 200,
+    dp_delay: int = 100,
+    batchSize: int = 128,
+    lr: float = 0.0002,
+    beta1: float = 0.5,
+    verbose: int = 1,
+    lSmooth: float = 0.95,
+    privacy_ratio: float = 1.0,
+    SplitTF: bool = False,
+    device: Optional[torch.device] = None,
+):
+    """PrivGAN training loop in PyTorch."""
+
+    device = _get_device(device)
+
+    if generators is None:
+        generators = [MNIST_Generator(randomDim=randomDim), MNIST_Generator(randomDim=randomDim)]
+    if discriminators is None:
+        discriminators = [MNIST_Discriminator(), MNIST_Discriminator()]
     if len(generators) != len(discriminators):
-        print('Different number of generators and discriminators')
-        return()
-    else:
-        n_reps = len(generators)
-        
-    #throw error if n_reps = 1 
+        raise ValueError('Different number of generators and discriminators')
+
+    n_reps = len(generators)
     if n_reps == 1:
-        print('You cannot have only one generator-discriminator pair')
-        return()
-    
-    
-    X = []
-    t = len(X_train)//n_reps
+        raise ValueError('You cannot have only one generator-discriminator pair')
+
+    pDisc = pDisc or MNIST_DiscriminatorPrivate(OutSize=n_reps)
+
+    for g, d in zip(generators, discriminators):
+        g.to(device)
+        d.to(device)
+    pDisc.to(device)
+
+    g_opts = [make_optimizer(g, lr=lr, beta1=beta1) for g in generators]
+    d_opts = [make_optimizer(d, lr=lr, beta1=beta1) for d in discriminators]
+    p_opt = make_optimizer(pDisc, lr=lr, beta1=beta1)
+
+    bce = nn.BCELoss()
+    ce = nn.CrossEntropyLoss()
+
+    # split dataset across generators
+    X_splits: List[torch.Tensor] = []
     y_train = []
-    
+    t = len(X_train) // n_reps
     for i in range(n_reps):
-        if i<n_reps-1:
-            X += [X_train[i*t:(i+1)*t]]
-            y_train += [i]*t
+        if i < n_reps - 1:
+            X_splits.append(_to_tensor(X_train[i * t : (i + 1) * t], device))
+            y_train.extend([i] * t)
         else:
-            X += [X_train[i*t:]]
-            y_train += [i]*len(X_train[i*t:])
-    
-    y_train = np.array(y_train) + 0.0 
-    
-    pDisc2 = pDisc
-        
-    pDisc2.fit(X_train, y_train,
-          batch_size=batchSize,
-          epochs=disc_epochs,
-          verbose=verbose,
-          validation_data=(X_train, y_train))
-    
-    yp= np.argmax(pDisc2.predict(X_train), axis = 1)
-    print('dp-Accuracy:',np.sum(y_train == yp)/len(yp))
+            X_splits.append(_to_tensor(X_train[i * t :], device))
+            y_train.extend([i] * len(X_train[i * t :]))
+    y_train = np.array(y_train)
 
-    
-    
-    #define combined model 
-    outputs = []    
-    ganInput = Input(shape=(randomDim,))
-    loss = ['binary_crossentropy']*n_reps + ['sparse_categorical_crossentropy']*n_reps
-    Pout = []
-    loss_weights = [1.0]*n_reps + [1.0*privacy_ratio]*n_reps
-    
-    pDisc2.trainable = False
+    # pretrain privacy discriminator
+    TrainDiscriminator(X_train, y_train, discriminator=pDisc, epochs=disc_epochs, batchSize=batchSize, lr=lr, beta1=beta1, device=device)
+    with torch.no_grad():
+        logits = pDisc(_to_tensor(X_train, device))
+        yp = logits.argmax(dim=1).cpu().numpy()
+        print('dp-Accuracy:', np.mean(y_train == yp))
 
-    for i in range(n_reps):
-        discriminators[i].trainable = False
-        outputs += [discriminators[i](generators[i](ganInput))]
-        Pout += [pDisc2(generators[i](ganInput))]
-        
-        
-    #specify the combined GAN 
-    outputs += Pout
-    gan = Model(inputs = ganInput, outputs = outputs)       
-    gan.compile(loss = loss, loss_weights = loss_weights, optimizer=optim)
-
-            
-    #Get batchcount
     batchCount = int(t // batchSize)
     print('Epochs:', epochs)
     print('Batch size:', batchSize)
     print('Batches per epoch:', batchCount)
-    
-    dLosses = np.zeros((n_reps,epochs))
+
+    dLosses = np.zeros((n_reps, epochs))
     dpLosses = np.zeros(epochs)
     gLosses = np.zeros(epochs)
 
     for e in range(epochs):
-        d_t = np.zeros((n_reps,batchCount))
+        d_t = np.zeros((n_reps, batchCount))
         dp_t = np.zeros(batchCount)
         g_t = np.zeros(batchCount)
-        d_t3acc = np.zeros(batchCount)
-        
+
         for i in range(batchCount):
-            # Get a random set of input noise and images
-            noise = np.random.normal(0, 1, size=[batchSize, randomDim])
-            imageBatch = []
-            generatedImages = []
-            yDis2 = []
-            yDis2f = []
-            pDisc2.trainable = False
-            
-            
+            noise = torch.randn(batchSize, randomDim, device=device)
+            generatedImages: List[torch.Tensor] = []
+            yDis2: List[int] = []
+            yDis2f: List[np.ndarray] = []
+
+            # discriminator updates
             for j in range(n_reps):
-                imageBatch = X[j][np.random.randint(0, len(X[j]), size=batchSize)]
-                generatedImages += [generators[j].predict(noise)]
+                real_batch = X_splits[j][torch.randint(0, len(X_splits[j]), (batchSize,), device=device)]
+                fake_batch = generators[j](noise)
+                generatedImages.append(fake_batch)
 
-                yDis = np.zeros(2*batchSize)
-                yDis[:batchSize] = lSmooth
-                discriminators[j].trainable = True
-                
-                if SplitTF:                    
-                    d_r = discriminators[j].train_on_batch(imageBatch, lSmooth*np.ones(batchSize))
-                    d_f = discriminators[j].train_on_batch(generatedImages[j],np.zeros(batchSize))
-                    d_t[j,i] = d_r + d_f
-                else:
-                    X_temp = np.concatenate([imageBatch, generatedImages[j]])
-                    d_t[j,i] = discriminators[j].train_on_batch(X_temp, yDis)
-                    
-                discriminators[j].trainable = False
-                l = list(range(n_reps))
-                del(l[j])
-                yDis2 += [j]*batchSize
-                yDis2f += [np.random.choice(l,(batchSize,))]
-            
-            yDis2 = np.array(yDis2)
-            
-            #Train privacy discriminator
-            generatedImages = np.concatenate(generatedImages)
+                real_labels = torch.full((batchSize, 1), lSmooth, device=device)
+                fake_labels = torch.zeros(batchSize, 1, device=device)
 
-            
-            if e >= dp_delay: 
-                pDisc2.trainable = True
-                dp_t[i] = pDisc2.train_on_batch(generatedImages, yDis2)
-                pDisc2.trainable = False
-                
-            
-            yGen = [np.ones(batchSize)]*n_reps + yDis2f
-            
-            #Train combined model
-            g_t[i] = gan.train_on_batch(noise, yGen)[0]
-            
+                _set_requires_grad(discriminators[j], True)
+                d_opts[j].zero_grad()
+                d_loss_real = bce(discriminators[j](real_batch), real_labels)
+                d_loss_fake = bce(discriminators[j](fake_batch.detach()), fake_labels)
+                d_loss = d_loss_real + d_loss_fake
+                d_loss.backward()
+                d_opts[j].step()
+                _set_requires_grad(discriminators[j], False)
+
+                d_t[j, i] = d_loss.item()
+                labels_other = list(range(n_reps))
+                labels_other.remove(j)
+                yDis2.extend([j] * batchSize)
+                yDis2f.append(np.random.choice(labels_other, size=batchSize))
+
+            yDis2_arr = np.array(yDis2)
+            all_generated = torch.cat(generatedImages, dim=0)
+
+            # privacy discriminator update
+            if e >= dp_delay:
+                _set_requires_grad(pDisc, True)
+                p_opt.zero_grad()
+                logits = pDisc(all_generated.detach())
+                dp_loss = ce(logits, torch.tensor(yDis2_arr, device=device))
+                dp_loss.backward()
+                p_opt.step()
+                _set_requires_grad(pDisc, False)
+                dp_t[i] = dp_loss.item()
+
+            # generator updates
+            _set_requires_grad(pDisc, False)
+            for j in range(n_reps):
+                g_opts[j].zero_grad()
+                adv_labels = torch.ones(batchSize, 1, device=device)
+                adv_loss = bce(discriminators[j](generatedImages[j]), adv_labels)
+                priv_targets = torch.tensor(yDis2f[j], device=device)
+                priv_loss = ce(pDisc(generatedImages[j]), priv_targets)
+                g_loss = adv_loss + privacy_ratio * priv_loss
+                g_loss.backward()
+                g_opts[j].step()
+                g_t[i] += g_loss.item()
+
             if verbose == 1:
-                print(
-                    'epoch = %d/%d, batch = %d/%d' % (e, epochs, i, batchCount),
-                    100*' ',
-                    end='\r'
-                )
+                print(f"epoch = {e}/{epochs}, batch = {i+1}/{batchCount}", end='\r')
 
-                      
-
-        # Store loss of most recent batch from this epoch
-        dLosses[:,e] = np.mean(d_t, axis = 1)
-        dpLosses[e] = np.mean(dp_t)
+        dLosses[:, e] = np.mean(d_t, axis=1)
+        dpLosses[e] = np.mean(dp_t) if np.any(dp_t) else 0.0
         gLosses[e] = np.mean(g_t)
-        
-        if e%verbose == 0:
-            print('epoch =',e)
-            print('dLosses =', np.mean(d_t, axis = 1))
-            print('dpLosses =', np.mean(dp_t))
-            print('gLosses =', np.mean(g_t))
-            yp= np.argmax(pDisc2.predict(generatedImages), axis = 1)
-            print('dp-Accuracy:',np.sum(yDis2 == yp)/len(yp))
-            
-    return (generators, discriminators, pDisc2, dLosses, dpLosses, gLosses)
+
+        if verbose == 1:
+            print('epoch =', e)
+            print('dLosses =', np.mean(d_t, axis=1))
+            print('dpLosses =', dpLosses[e])
+            print('gLosses =', gLosses[e])
+            with torch.no_grad():
+                yp = pDisc(all_generated).argmax(dim=1).cpu().numpy()
+                print('dp-Accuracy:', np.mean(yDis2_arr == yp))
+
+    return generators, discriminators, pDisc, dLosses, dpLosses, gLosses
 
 
-######################################### Ancillary functions ##########################################################
+######################################### Ancillary functions ################################
 
 
-
-def DisplayImages(generator, randomDim = 100, NoImages = 100, figSize = (10,10), TargetShape = (28,28)):
-    
-    #check to see if the figure size is valid
-    if (len(figSize)!=2) or (figSize[0]*figSize[1]<NoImages):
+def DisplayImages(
+    generator: nn.Module,
+    randomDim: int = 100,
+    NoImages: int = 100,
+    figSize: Tuple[int, int] = (10, 10),
+    TargetShape: Tuple[int, ...] = (28, 28),
+    device: Optional[torch.device] = None,
+):
+    # check figure size
+    if (len(figSize) != 2) or (figSize[0] * figSize[1] < NoImages):
         print('Invalid Figure Size')
-        return()
-    
-    #generate the synthetic images for a given generator
-    noise = np.random.normal(0, 1, size=[NoImages, randomDim]) 
-    generatedImages = generator.predict(noise)
-    
-    #re-shape the images 
-    TargetShape = tuple([NoImages]+list(TargetShape))
+        return
+
+    device = _get_device(device)
+    generator.eval()
+    with torch.no_grad():
+        noise = torch.randn(NoImages, randomDim, device=device)
+        generatedImages = generator(noise).cpu().numpy()
+
+    TargetShape = tuple([NoImages] + list(TargetShape))
     generatedImages = generatedImages.reshape(TargetShape)
-    
-    #plot the images 
+
     for i in range(generatedImages.shape[0]):
-        plt.subplot(figSize[0],figSize[1], i+1)
+        plt.subplot(figSize[0], figSize[1], i + 1)
         plt.imshow(generatedImages[i], interpolation='nearest', cmap='gray_r')
         plt.axis('off')
     plt.tight_layout()
 
-    
-############################################ Attacks #####################################################################
 
-def WBattack(X,X_comp, discriminator):
-    
+############################################ Attacks #########################################
+
+
+def _predict_disc(discriminator: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
+    discriminator.eval()
+    with torch.no_grad():
+        preds = discriminator(_to_tensor(X, device)).cpu().numpy().squeeze()
+    return preds
+
+
+def WBattack(X: np.ndarray, X_comp: np.ndarray, discriminator: nn.Module, device: Optional[torch.device] = None):
+    device = _get_device(device)
     Dat = np.concatenate([X, X_comp])
-    p = discriminator.predict(Dat)
-    In = np.argsort(-p[:,0])
-    In = In[:len(X)]
-    Accuracy = np.sum(1.*(In<len(X)))/len(X)
-    print('White-box attack accuracy:',Accuracy)
-    
-    return(Accuracy)
+    p = _predict_disc(discriminator, Dat, device)
+    In = np.argsort(-p)[: len(X)]
+    Accuracy = np.sum(1.0 * (In < len(X))) / len(X)
+    print('White-box attack accuracy:', Accuracy)
+    return Accuracy
 
 
-def WBattack_priv(X,X_comp, discriminators):
-    
+def WBattack_priv(
+    X: np.ndarray,
+    X_comp: np.ndarray,
+    discriminators: Sequence[nn.Module],
+    device: Optional[torch.device] = None,
+):
+    device = _get_device(device)
     Dat = np.concatenate([X, X_comp])
-    Pred = []
-    
-    for i in range(len(discriminators)):
-        Pred += [discriminators[i].predict(Dat)[:,0]]
-        
-    
-    p_mean = np.mean(Pred, axis = 0)
-    p_max = np.max(Pred, axis = 0)
-    
-    In_mean = np.argsort(-p_mean)
-    In_mean = In_mean[:len(X)]
+    Pred = [
+        _predict_disc(discriminators[i], Dat, device)
+        for i in range(len(discriminators))
+    ]
+    p_mean = np.mean(Pred, axis=0)
+    p_max = np.max(Pred, axis=0)
 
-    In_max = np.argsort(-p_max)
-    In_max = In_max[:len(X)]
-    
-    Acc_max = np.sum(1.*(In_max<len(X)))/len(X)
-    Acc_mean = np.sum(1.*(In_mean<len(X)))/len(X)
-    
-    print('White-box attack accuracy (max):',Acc_max)
-    print('White-box attack accuracy (mean):',Acc_mean)
-    
-    return(Acc_max,Acc_mean)
-        
-    
-def WBattack_TVD(X,X_comp, discriminator):
-    
-    n1, _ = np.histogram(discriminator.predict(X)[:,0], bins = 50, density = True, range = [0,1])
-    n2, _ = np.histogram(discriminator.predict(X_comp)[:,0], bins = 50, density = True, range = [0,1])
-    tvd = 0.5*np.linalg.norm(n1-n2,1)/50.0
-    
-    print('Total Variational Distance:',tvd)
-    
-    return(tvd)    
-    
-def WBattack_TVD_priv(X,X_comp, discriminators):
-    
+    In_mean = np.argsort(-p_mean)[: len(X)]
+    In_max = np.argsort(-p_max)[: len(X)]
+
+    Acc_max = np.sum(1.0 * (In_max < len(X))) / len(X)
+    Acc_mean = np.sum(1.0 * (In_mean < len(X))) / len(X)
+
+    print('White-box attack accuracy (max):', Acc_max)
+    print('White-box attack accuracy (mean):', Acc_mean)
+    return Acc_max, Acc_mean
+
+
+def WBattack_TVD(X: np.ndarray, X_comp: np.ndarray, discriminator: nn.Module, device: Optional[torch.device] = None):
+    device = _get_device(device)
+    n1, _ = np.histogram(_predict_disc(discriminator, X, device), bins=50, density=True, range=[0, 1])
+    n2, _ = np.histogram(_predict_disc(discriminator, X_comp, device), bins=50, density=True, range=[0, 1])
+    tvd = 0.5 * np.linalg.norm(n1 - n2, 1) / 50.0
+    print('Total Variational Distance:', tvd)
+    return tvd
+
+
+def WBattack_TVD_priv(
+    X: np.ndarray,
+    X_comp: np.ndarray,
+    discriminators: Sequence[nn.Module],
+    device: Optional[torch.device] = None,
+):
+    device = _get_device(device)
     tvd = []
-    
-    for i in range(len(discriminators)):
-        n1, _= np.histogram(discriminators[i].predict(X)[:,0], bins = 50, density = True, range = [0,1])
-        n2, _ = np.histogram(discriminators[i].predict(X_comp)[:,0], bins = 50, density = True, range = [0,1])
-        tvd += [0.5*np.linalg.norm(n1-n2,1)/50.0]
-    
-    print('Total Variational Distance - max:',max(tvd))
-    print('Total Variational Distance - mean:',np.mean(tvd))
-    
-    return(np.max(tvd),np.mean(tvd))   
+    for disc in discriminators:
+        n1, _ = np.histogram(_predict_disc(disc, X, device), bins=50, density=True, range=[0, 1])
+        n2, _ = np.histogram(_predict_disc(disc, X_comp, device), bins=50, density=True, range=[0, 1])
+        tvd.append(0.5 * np.linalg.norm(n1 - n2, 1) / 50.0)
+    print('Total Variational Distance - max:', max(tvd))
+    print('Total Variational Distance - mean:', np.mean(tvd))
+    return float(np.max(tvd)), float(np.mean(tvd))
 
 
-def MC_eps_attack(X, X_comp, X_ho, generator, N = 100000, M = 100, n_pc = 40, reps = 10):
-    
-    #flatten images 
-    if len(X.shape)==3:
-        sh = X.shape[1]*X.shape[2]        
-    elif len(X.shape)==2:
-        sh = X.shape[1]
-    else:
-        sh = X.shape[1]*X.shape[2]*X.shape[3]
-        
-    X = np.reshape(X, (len(X),sh))
-    X_comp = np.reshape(X_comp, (len(X_comp),sh))
-    X_ho = np.reshape(X_ho, (len(X_ho),sh))
-    
-    #fit PCA
+def _generate_fake(generator: nn.Module, N: int, randomDim: int, device: torch.device) -> np.ndarray:
+    generator.eval()
+    with torch.no_grad():
+        noise = torch.randn(N, randomDim, device=device)
+        X_fake = generator(noise).cpu().numpy()
+    return X_fake
+
+
+def MC_eps_attack(
+    X: np.ndarray,
+    X_comp: np.ndarray,
+    X_ho: np.ndarray,
+    generator: nn.Module,
+    N: int = 100000,
+    M: int = 100,
+    n_pc: int = 40,
+    reps: int = 10,
+    randomDim: int = 100,
+    device: Optional[torch.device] = None,
+):
+    device = _get_device(device)
+    sh = int(np.prod(X.shape[1:]))
+    X = np.reshape(X, (len(X), sh))
+    X_comp = np.reshape(X_comp, (len(X_comp), sh))
+    X_ho = np.reshape(X_ho, (len(X_ho), sh))
+
     pca = PCA(n_components=n_pc)
     pca.fit(X_ho)
-        
+
     res = []
-    
-    for r in range(reps):
-        
-        #generate, flatten and dimensionality reduce a ton of synthetic samples 
-        noise = np.random.normal(0, 1, size=[N, 100])
-        X_fake = generator.predict(noise)
-        X_fake = np.reshape(X_fake,(len(X_fake),sh))
+    for _ in range(reps):
+        X_fake = _generate_fake(generator, N, randomDim, device)
+        X_fake = np.reshape(X_fake, (len(X_fake), sh))
         X_fake_dr = pca.transform(X_fake)
-    
-                
+
         idx1 = np.random.randint(len(X), size=M)
-        idx2 = np.random.randint(len(X_comp), size=M)
-    
-        M_x = pca.transform(np.reshape(X[idx1,:],(len(X[idx1,:]),sh)))
-        M_xc = pca.transform(np.reshape(X_comp[idx1,:],(len(X_comp[idx1,:]),sh)))
-        
+        M_x = pca.transform(np.reshape(X[idx1, :], (len(idx1), sh)))
+        M_xc = pca.transform(np.reshape(X_comp[idx1, :], (len(idx1), sh)))
+
         min_x = []
         min_xc = []
-
-        #calculate median epsilon 
         for i in range(M):
-            temp_x = np.tile(M_x[i,:],(len(X_fake_dr),1))
-            temp_xc = np.tile(M_xc[i,:],(len(X_fake_dr),1))
+            temp_x = np.tile(M_x[i, :], (len(X_fake_dr), 1))
+            temp_xc = np.tile(M_xc[i, :], (len(X_fake_dr), 1))
+            D_x = np.sqrt(np.sum((temp_x - X_fake_dr) ** 2, axis=1))
+            D_xc = np.sqrt(np.sum((temp_xc - X_fake_dr) ** 2, axis=1))
+            min_x.append(np.min(D_x))
+            min_xc.append(np.min(D_xc))
 
-            D_x = np.sqrt(np.sum((temp_x-X_fake_dr)**2,axis=1))
-            D_xc = np.sqrt(np.sum((temp_xc-X_fake_dr)**2,axis=1))
-
-            min_x += [np.min(D_x)]
-            min_xc += [np.min(D_xc)]
-            
         eps = np.median(min_x + min_xc)
-            
         s_x = []
         s_xc = []
-        
-        #estimate the integral
         for i in range(M):
-            temp_x = np.tile(M_x[i,:],(len(X_fake_dr),1))
-            temp_xc = np.tile(M_xc[i,:],(len(X_fake_dr),1))
+            temp_x = np.tile(M_x[i, :], (len(X_fake_dr), 1))
+            temp_xc = np.tile(M_xc[i, :], (len(X_fake_dr), 1))
+            D_x = np.sqrt(np.sum((temp_x - X_fake_dr) ** 2, axis=1))
+            D_xc = np.sqrt(np.sum((temp_xc - X_fake_dr) ** 2, axis=1))
+            s_x.append(np.sum(D_x <= eps) / len(X_fake_dr))
+            s_xc.append(np.sum(D_xc <= eps) / len(X_fake_dr))
 
-            D_x = np.sqrt(np.sum((temp_x-X_fake_dr)**2,axis=1))
-            D_xc = np.sqrt(np.sum((temp_xc-X_fake_dr)**2,axis=1))
-
-            s_x += [np.sum(D_x <= eps)/len(X_fake_dr)]
-            s_xc += [np.sum(D_xc <= eps)/len(X_fake_dr)]
-            
         s_x_xc = np.array(s_x + s_xc)
         In = np.argsort(-s_x_xc)[:M]
+        res.append(1 if np.sum(In < M) >= 0.5 * M else 0)
+
+    return float(np.mean(res))
 
 
-        if np.sum(In<M)>= 0.5*M:
-            res += [1]
-        else:
-            res += [0]
-            
-    
-    return(np.mean(res))
-            
-    
-    
+def MC_eps_attack_priv(
+    X: np.ndarray,
+    X_comp: np.ndarray,
+    X_ho: np.ndarray,
+    generators: Sequence[nn.Module],
+    N: int = 100000,
+    M: int = 100,
+    n_pc: int = 40,
+    reps: int = 10,
+    randomDim: int = 100,
+    device: Optional[torch.device] = None,
+):
+    device = _get_device(device)
+    sh = int(np.prod(X.shape[1:]))
+    X = np.reshape(X, (len(X), sh))
+    X_comp = np.reshape(X_comp, (len(X_comp), sh))
+    X_ho = np.reshape(X_ho, (len(X_ho), sh))
 
-def MC_eps_attack_priv(X, X_comp, X_ho, generators, N = 100000, M = 100, n_pc = 40, reps = 10):
-    
-    #flatten images 
-    if len(X.shape)==3:
-        sh = X.shape[1]*X.shape[2]        
-    elif len(X.shape)==2:
-        sh = X.shape[1]
-    else:
-        sh = X.shape[1]*X.shape[2]*X.shape[3]
-        
-    X = np.reshape(X, (len(X),sh))
-    X_comp = np.reshape(X_comp, (len(X_comp),sh))
-    X_ho = np.reshape(X_ho, (len(X_ho),sh))
-    
-    #fit PCA
     pca = PCA(n_components=n_pc)
     pca.fit(X_ho)
-        
+
     res = []
-    
-    for r in range(reps):
-        
-        #generate, flatten and dimensionality reduce a ton of synthetic samples 
+    for _ in range(reps):
         n_g = len(generators)
-        X_fake_dr  = []
+        X_fake_dr = []
         for j in range(n_g):
-            noise = np.random.normal(0, 1, size=[int(N/n_g), 100])
-            X_fake = generators[j].predict(noise)
-            X_fake = np.reshape(X_fake,(len(X_fake),sh))
-            X_fake_dr += [pca.transform(X_fake)]
-            
+            X_fake = _generate_fake(generators[j], int(N / n_g), randomDim, device)
+            X_fake = np.reshape(X_fake, (len(X_fake), sh))
+            X_fake_dr.append(pca.transform(X_fake))
         X_fake_dr = np.vstack(X_fake_dr)
 
-        
         idx1 = np.random.randint(len(X), size=M)
-        idx2 = np.random.randint(len(X_comp), size=M)
-    
-        M_x = pca.transform(np.reshape(X[idx1,:],(len(X[idx1,:]),sh)))
-        M_xc = pca.transform(np.reshape(X_comp[idx1,:],(len(X_comp[idx1,:]),sh)))
-        
+        M_x = pca.transform(np.reshape(X[idx1, :], (len(idx1), sh)))
+        M_xc = pca.transform(np.reshape(X_comp[idx1, :], (len(idx1), sh)))
+
         min_x = []
         min_xc = []
-
-        #calculate median epsilon 
         for i in range(M):
-            temp_x = np.tile(M_x[i,:],(len(X_fake_dr),1))
-            temp_xc = np.tile(M_xc[i,:],(len(X_fake_dr),1))
+            temp_x = np.tile(M_x[i, :], (len(X_fake_dr), 1))
+            temp_xc = np.tile(M_xc[i, :], (len(X_fake_dr), 1))
+            D_x = np.sqrt(np.sum((temp_x - X_fake_dr) ** 2, axis=1))
+            D_xc = np.sqrt(np.sum((temp_xc - X_fake_dr) ** 2, axis=1))
+            min_x.append(np.min(D_x))
+            min_xc.append(np.min(D_xc))
 
-            D_x = np.sqrt(np.sum((temp_x-X_fake_dr)**2,axis=1))
-            D_xc = np.sqrt(np.sum((temp_xc-X_fake_dr)**2,axis=1))
-
-            min_x += [np.min(D_x)]
-            min_xc += [np.min(D_xc)]
-            
         eps = np.median(min_x + min_xc)
-            
         s_x = []
         s_xc = []
-        
-        #estimate the integral
         for i in range(M):
-            temp_x = np.tile(M_x[i,:],(len(X_fake_dr),1))
-            temp_xc = np.tile(M_xc[i,:],(len(X_fake_dr),1))
+            temp_x = np.tile(M_x[i, :], (len(X_fake_dr), 1))
+            temp_xc = np.tile(M_xc[i, :], (len(X_fake_dr), 1))
+            D_x = np.sqrt(np.sum((temp_x - X_fake_dr) ** 2, axis=1))
+            D_xc = np.sqrt(np.sum((temp_xc - X_fake_dr) ** 2, axis=1))
+            s_x.append(np.sum(D_x <= eps) / len(X_fake_dr))
+            s_xc.append(np.sum(D_xc <= eps) / len(X_fake_dr))
 
-            D_x = np.sqrt(np.sum((temp_x-X_fake_dr)**2,axis=1))
-            D_xc = np.sqrt(np.sum((temp_xc-X_fake_dr)**2,axis=1))
-
-            s_x += [np.sum(D_x <= eps)/len(X_fake_dr)]
-            s_xc += [np.sum(D_xc <= eps)/len(X_fake_dr)]
-            
         s_x_xc = np.array(s_x + s_xc)
         In = np.argsort(-s_x_xc)[:M]
+        res.append(1 if np.sum(In < M) >= 0.5 * M else 0)
+
+    return float(np.mean(res))
 
 
-        if np.sum(In<M)>= 0.5*M:
-            res += [1]
-        else:
-            res += [0]
-            
-    
-    return(np.mean(res))
+__all__ = [
+    'SimpGAN',
+    'TrainDiscriminator',
+    'privGAN',
+    'DisplayImages',
+    'WBattack',
+    'WBattack_priv',
+    'WBattack_TVD',
+    'WBattack_TVD_priv',
+    'MC_eps_attack',
+    'MC_eps_attack_priv',
+]
