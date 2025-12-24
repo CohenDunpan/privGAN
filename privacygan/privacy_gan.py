@@ -224,7 +224,8 @@ def privGAN(
         yp = logits.argmax(dim=1).cpu().numpy()
         print('dp-Accuracy:', np.mean(y_train == yp))
 
-    batchCount = int(t // batchSize)
+    # Ensure at least one batch per epoch to avoid empty loops when t < batchSize
+    batchCount = max(1, int(np.ceil(t / batchSize)))
     print('Epochs:', epochs)
     print('Batch size:', batchSize)
     print('Batches per epoch:', batchCount)
